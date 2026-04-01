@@ -6,19 +6,46 @@
 set -e
 
 # --- Locate cli.js ---
+CLI=""
+# 1) npm global install: follow symlink from `which claude`
 CLAUDE_BIN="$(which claude 2>/dev/null || true)"
-if [ -z "$CLAUDE_BIN" ]; then
-  echo "❌ claude not found in PATH"; exit 1
+if [ -n "$CLAUDE_BIN" ]; then
+  REAL="$(readlink -f "$CLAUDE_BIN" 2>/dev/null || readlink "$CLAUDE_BIN" 2>/dev/null || true)"
+  [ -z "$REAL" ] && REAL="$(cd "$(dirname "$CLAUDE_BIN")" && pwd)/$(basename "$CLAUDE_BIN")"
+  CANDIDATE="$(dirname "$REAL")/cli.js"
+  [ -f "$CANDIDATE" ] && CLI="$CANDIDATE"
 fi
-REAL="$(readlink -f "$CLAUDE_BIN" 2>/dev/null || readlink "$CLAUDE_BIN" 2>/dev/null)"
-if [ -z "$REAL" ]; then
-  # macOS fallback
-  REAL="$(cd "$(dirname "$CLAUDE_BIN")" && pwd)/$(basename "$CLAUDE_BIN")"
+# 2) native local install: ~/.claude/local/node_modules/...
+if [ -z "$CLI" ]; then
+  CANDIDATE="$HOME/.claude/local/node_modules/@anthropic-ai/claude-code/cli.js"
+  [ -f "$CANDIDATE" ] && CLI="$CANDIDATE"
 fi
-CLI="$(dirname "$REAL")/cli.js"
-if [ ! -f "$CLI" ]; then
-  echo "❌ cli.js not found at $CLI"; exit 1
+# 3) Linux XDG: ~/.local/share/claude/...
+if [ -z "$CLI" ]; then
+  XDG="${XDG_DATA_HOME:-$HOME/.local/share}/claude"
+  if [ -d "$XDG/versions" ]; then
+    # find the latest version directory
+    LATEST="$(ls -1t "$XDG/versions" 2>/dev/null | head -1)"
+    [ -n "$LATEST" ] && CANDIDATE="$XDG/versions/$LATEST/cli.js"
+    [ -f "$CANDIDATE" ] && CLI="$CANDIDATE"
+  fi
+  # also check node_modules pattern under XDG
+  if [ -z "$CLI" ]; then
+    CANDIDATE="$XDG/node_modules/@anthropic-ai/claude-code/cli.js"
+    [ -f "$CANDIDATE" ] && CLI="$CANDIDATE"
+  fi
 fi
+if [ -z "$CLI" ]; then
+  echo "❌ cli.js not found. Searched:"
+  echo "   - symlink from 'which claude'"
+  echo "   - ~/.claude/local/node_modules/@anthropic-ai/claude-code/cli.js"
+  echo "   - ~/.local/share/claude/versions/*/cli.js"
+  echo "   Tip: set CLI_PATH env var to override: CLI_PATH=/path/to/cli.js sh $0"
+  exit 1
+fi
+# Allow manual override
+[ -n "$CLI_PATH" ] && CLI="$CLI_PATH"
+echo "📦 Found cli.js: $CLI"
 
 # --- Locate config ---
 CONFIG="$HOME/.claude.json"
@@ -126,5 +153,48 @@ if [ -n "$NAME" ]; then
   "
 fi
 
+# --- Install auto-patch wrapper ---
+PATCH_SCRIPT="$HOME/.claude/patch-companion.sh"
+cat > "$PATCH_SCRIPT" << PATCHEOF
+#!/bin/sh
+# Auto-patch companion SALT before launching claude
+SALT="$SALT"
+CLI=""
+CLAUDE_BIN="\$(which claude 2>/dev/null || true)"
+if [ -n "\$CLAUDE_BIN" ]; then
+  REAL="\$(readlink -f "\$CLAUDE_BIN" 2>/dev/null || readlink "\$CLAUDE_BIN" 2>/dev/null || true)"
+  [ -z "\$REAL" ] && REAL="\$(cd "\$(dirname "\$CLAUDE_BIN")" && pwd)/\$(basename "\$CLAUDE_BIN")"
+  C="\$(dirname "\$REAL")/cli.js"; [ -f "\$C" ] && CLI="\$C"
+fi
+[ -z "\$CLI" ] && C="\$HOME/.claude/local/node_modules/@anthropic-ai/claude-code/cli.js" && [ -f "\$C" ] && CLI="\$C"
+[ -z "\$CLI" ] && exit 0
+if ! grep -q "\$SALT" "\$CLI" 2>/dev/null; then
+  if [ "\$(uname)" = "Darwin" ]; then
+    sed -i '' "s/friend-2026-[0-9]*/\$SALT/g" "\$CLI"
+  else
+    sed -i "s/friend-2026-[0-9]*/\$SALT/g" "\$CLI"
+  fi
+fi
+PATCHEOF
+chmod +x "$PATCH_SCRIPT"
+
+# Detect shell rc file
+SHELL_RC=""
+case "$SHELL" in
+  */zsh)  SHELL_RC="$HOME/.zshrc";;
+  */bash) SHELL_RC="$HOME/.bashrc";;
+  *)      SHELL_RC="$HOME/.profile";;
+esac
+
+# Add alias: claude → patch then launch
+ALIAS_LINE="alias claude='sh $PATCH_SCRIPT && command claude'"
+if [ -f "$SHELL_RC" ] && grep -qF "patch-companion" "$SHELL_RC"; then
+  echo "✅ Shell alias already installed in $SHELL_RC"
+else
+  printf "\n# Claude Companion auto-patch\n%s\n" "$ALIAS_LINE" >> "$SHELL_RC"
+  echo "✅ Added alias to $SHELL_RC"
+fi
+
 echo ""
-echo "🎉 Done! Restart claude to meet your new Legendary companion."
+echo "🎉 Done! Run 'source $SHELL_RC' or open a new terminal."
+echo "   Every 'claude' launch will auto-patch your companion."
